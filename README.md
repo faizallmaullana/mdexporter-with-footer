@@ -39,6 +39,20 @@ go run . -out hasil.pdf -margin-top 5 -margin-right 15 \
   -margin-bottom 25 -margin-left 15 catatan.md
 ```
 
+## List of Content otomatis
+
+Tulis `!list-of-content` pada satu baris tersendiri di file Markdown. Baris itu
+akan diganti dengan daftar isi berisi heading level 1–3 (bertingkat dan bisa
+diklik). Setelah daftar isi, konten berikutnya dimulai di halaman baru.
+
+```md
+# Laporan Proyek
+
+!list-of-content
+
+## Latar Belakang
+```
+
 Ganti footer terpasang dengan file lain (perlu hak akses untuk menulis ke
 `/usr/src`):
 

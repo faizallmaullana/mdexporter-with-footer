@@ -19,7 +19,10 @@ import (
 	"time"
 
 	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
+	"github.com/yuin/goldmark/parser"
+	"github.com/yuin/goldmark/text"
 )
 
 const (
@@ -28,6 +31,11 @@ const (
 	localFooterPath     = "public/footer.png"
 
 	defaultTimeout = 2 * time.Minute
+
+	// tocMarker is the Markdown line replaced by an auto-generated List of Content.
+	tocMarker = "!list-of-content"
+	// tocMaxLevel is the deepest heading level included in the List of Content.
+	tocMaxLevel = 3
 )
 
 type Config struct {
@@ -53,7 +61,14 @@ type PageMargins struct {
 
 var markdownParser = goldmark.New(
 	goldmark.WithExtensions(extension.GFM),
+	goldmark.WithParserOptions(parser.WithAutoHeadingID()),
 )
+
+type tocEntry struct {
+	Level int
+	ID    string
+	Title string
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -97,7 +112,7 @@ func parseFlags() (Config, error) {
 	fs.StringVar(&config.Footer, "footer", "", "footer image path")
 	fs.StringVar(&config.ChangeFooter, "changefooter", "", "replace installed footer image")
 
-	fs.Float64Var(&config.MarginTop, "margin-top", 5, "top margin in mm")
+	fs.Float64Var(&config.MarginTop, "margin-top", 15, "top margin in mm")
 	fs.Float64Var(&config.MarginRight, "margin-right", 15, "right content margin in mm")
 	fs.Float64Var(&config.MarginBottom, "margin-bottom", 25, "bottom margin in mm")
 	fs.Float64Var(&config.MarginLeft, "margin-left", 15, "left content margin in mm")
@@ -217,15 +232,160 @@ func exportMarkdown(config Config) error {
 	return nil
 }
 
-// convertMarkdown converts Markdown content into HTML.
+// convertMarkdown converts Markdown content into HTML. A paragraph consisting
+// only of "!list-of-content" is replaced by a generated List of Content.
 func convertMarkdown(source []byte) (string, error) {
-	var output bytes.Buffer
+	doc := markdownParser.Parser().Parse(text.NewReader(source))
 
-	if err := markdownParser.Convert(source, &output); err != nil {
+	var entries []tocEntry
+	hasMarker := false
+
+	err := ast.Walk(doc, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+
+		switch n := node.(type) {
+		case *ast.Heading:
+			if n.Level <= tocMaxLevel {
+				var id string
+				if value, ok := n.AttributeString("id"); ok {
+					if b, ok := value.([]byte); ok {
+						id = string(b)
+					}
+				}
+				entries = append(entries, tocEntry{
+					Level: n.Level,
+					ID:    id,
+					Title: strings.TrimSpace(nodeText(n, source)),
+				})
+			}
+			return ast.WalkSkipChildren, nil
+		case *ast.Paragraph:
+			if strings.TrimSpace(nodeText(n, source)) == tocMarker {
+				hasMarker = true
+			}
+			return ast.WalkSkipChildren, nil
+		}
+
+		return ast.WalkContinue, nil
+	})
+	if err != nil {
 		return "", err
 	}
 
-	return output.String(), nil
+	var output bytes.Buffer
+	if err := markdownParser.Renderer().Render(&output, source, doc); err != nil {
+		return "", err
+	}
+
+	html := output.String()
+	if hasMarker {
+		html = strings.ReplaceAll(html, "<p>"+tocMarker+"</p>", buildTOC(entries))
+	}
+
+	return html, nil
+}
+
+// nodeText returns the plain text content of an inline-containing node.
+func nodeText(node ast.Node, source []byte) string {
+	var buf strings.Builder
+
+	_ = ast.Walk(node, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+
+		switch t := n.(type) {
+		case *ast.Text:
+			buf.Write(t.Segment.Value(source))
+			if t.SoftLineBreak() || t.HardLineBreak() {
+				buf.WriteByte(' ')
+			}
+		case *ast.String:
+			buf.Write(t.Value)
+		case *ast.RawHTML:
+			return ast.WalkSkipChildren, nil
+		}
+
+		return ast.WalkContinue, nil
+	})
+
+	return buf.String()
+}
+
+// buildTOC renders the List of Content as nested lists linking to headings.
+func buildTOC(entries []tocEntry) string {
+	var buf strings.Builder
+
+	buf.WriteString(`<nav class="toc">` + "\n")
+	buf.WriteString(`<p class="toc-title">List of Content</p>` + "\n")
+
+	if len(entries) == 0 {
+		buf.WriteString("</nav>\n")
+		return buf.String()
+	}
+
+	base := entries[0].Level
+	for _, entry := range entries {
+		if entry.Level < base {
+			base = entry.Level
+		}
+	}
+
+	openItem := func(level int) {
+		buf.WriteString(`<li class="toc-l` + strconv.Itoa(level) + `">`)
+	}
+
+	depth := 0
+	for _, entry := range entries {
+		target := entry.Level - base + 1
+
+		if depth == 0 {
+			buf.WriteString("<ul>\n")
+			depth = 1
+			openItem(depth)
+		} else if target > depth {
+			for depth < target {
+				depth++
+				buf.WriteString("\n<ul>\n")
+				openItem(depth)
+			}
+		} else {
+			for depth > target {
+				buf.WriteString("</li>\n</ul>\n")
+				depth--
+			}
+			buf.WriteString("</li>\n")
+			openItem(depth)
+		}
+
+		title := htmlEscape(entry.Title)
+		if entry.ID != "" {
+			buf.WriteString(`<a class="toc-entry" href="#` + htmlEscape(entry.ID) + `">` + title + `</a>`)
+		} else {
+			buf.WriteString(`<span class="toc-entry">` + title + `</span>`)
+		}
+	}
+
+	for depth > 0 {
+		buf.WriteString("</li>\n</ul>\n")
+		depth--
+	}
+
+	buf.WriteString("</nav>\n")
+	return buf.String()
+}
+
+// htmlEscape escapes text for safe inclusion in HTML content and attributes.
+func htmlEscape(value string) string {
+	return strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		`"`, "&quot;",
+		"'", "&#39;",
+	).Replace(value)
 }
 
 // buildHTMLDocument generates the complete HTML document.
@@ -353,6 +513,98 @@ ul, ol {
 
 li {
 	margin-bottom: 4px;
+}
+
+.toc {
+	margin: 0 0 16px;
+	break-after: page;
+	page-break-after: always;
+}
+
+.toc-title {
+	font-size: 1.5em;
+	font-weight: bold;
+	letter-spacing: 0.5px;
+	text-transform: uppercase;
+	color: #111;
+	margin: 0 0 12px;
+	padding-bottom: 6px;
+	border-bottom: 2px solid #222;
+}
+
+.toc ul {
+	list-style: none;
+	padding-left: 0;
+	margin: 0;
+}
+
+.toc ul ul {
+	margin: 2px 0 4px 6px;
+	padding-left: 16px;
+	border-left: 2px solid #d5dbe5;
+}
+
+.toc li {
+	margin: 0;
+	break-inside: avoid;
+}
+
+.toc a {
+	color: inherit;
+	text-decoration: none;
+}
+
+.toc-entry {
+	display: block;
+	padding: 2px 0;
+}
+
+/* Level 1: bold, separated by a rule. */
+.toc-l1 {
+	margin-top: 8px;
+}
+
+.toc-l1:first-child {
+	margin-top: 0;
+}
+
+.toc-l1 > .toc-entry {
+	font-size: 1.08em;
+	font-weight: bold;
+	color: #111;
+	padding: 4px 0;
+	border-bottom: 1px solid #e3e3e3;
+}
+
+/* Level 2: semibold with a triangle marker. */
+.toc-l2 > .toc-entry {
+	font-weight: 600;
+	color: #2a2a2a;
+}
+
+.toc-l2 > .toc-entry::before {
+	content: "\25B8";
+	color: #7a8699;
+	margin-right: 6px;
+}
+
+/* Level 3 and deeper: regular, smaller, muted with a dash marker. */
+.toc-l3 > .toc-entry,
+.toc-l4 > .toc-entry,
+.toc-l5 > .toc-entry,
+.toc-l6 > .toc-entry {
+	font-size: 0.93em;
+	font-weight: normal;
+	color: #555;
+}
+
+.toc-l3 > .toc-entry::before,
+.toc-l4 > .toc-entry::before,
+.toc-l5 > .toc-entry::before,
+.toc-l6 > .toc-entry::before {
+	content: "\2013";
+	color: #9aa3b0;
+	margin-right: 6px;
 }
 `,
 		formatMM(margins.Top),
