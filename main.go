@@ -50,6 +50,7 @@ type Config struct {
 	Output       string
 	Footer       string
 	ChangeFooter string
+	Diff         string
 
 	MarginTop    float64
 	MarginRight  float64
@@ -133,6 +134,7 @@ func parseFlags() (Config, error) {
 	fs.StringVar(&config.Input, "in", "", "input Markdown file (required)")
 	fs.StringVar(&config.Output, "out", "", "output PDF file")
 	fs.StringVar(&config.Footer, "footer", "", "footer image path")
+	fs.StringVar(&config.Diff, "diff", "", "older Markdown file to compare against (added=green, removed=red, modified=yellow)")
 	fs.StringVar(&config.ChangeFooter, "changefooter", "", "replace installed footer image")
 
 	fs.Float64Var(&config.MarginTop, "margin-top", 15, "top margin in mm")
@@ -140,11 +142,21 @@ func parseFlags() (Config, error) {
 	fs.Float64Var(&config.MarginBottom, "margin-bottom", 25, "bottom margin in mm")
 	fs.Float64Var(&config.MarginLeft, "margin-left", 15, "left content margin in mm")
 
-	if err := fs.Parse(os.Args[1:]); err != nil {
-		return config, err
+	// Parse flags and positionals in any order, so "file.md -diff old.md" works.
+	var positional []string
+	args := os.Args[1:]
+	for {
+		if err := fs.Parse(args); err != nil {
+			return config, err
+		}
+		rest := fs.Args()
+		if len(rest) == 0 {
+			break
+		}
+		positional = append(positional, rest[0])
+		args = rest[1:]
 	}
 
-	positional := fs.Args()
 	if config.Input != "" && len(positional) > 0 {
 		return config, errors.New("provide the input file either as a positional argument or with -in, not both")
 	}
@@ -224,6 +236,26 @@ func exportMarkdown(config Config) error {
 	markdown, err := os.ReadFile(input)
 	if err != nil {
 		return fmt.Errorf("read Markdown: %w", err)
+	}
+
+	if config.Diff != "" {
+		oldPath, err := filepath.Abs(config.Diff)
+		if err != nil {
+			return fmt.Errorf("resolve diff path: %w", err)
+		}
+		if err := validateFile(oldPath); err != nil {
+			return fmt.Errorf("diff: %w", err)
+		}
+		oldMarkdown, err := os.ReadFile(oldPath)
+		if err != nil {
+			return fmt.Errorf("read diff Markdown: %w", err)
+		}
+		enableDiffRendering()
+		merged, changed := buildDiffMarkdown(string(oldMarkdown), string(markdown))
+		if !changed {
+			fmt.Println("No differences found")
+		}
+		markdown = []byte(merged)
 	}
 
 	doc, err := convertMarkdown(markdown)
