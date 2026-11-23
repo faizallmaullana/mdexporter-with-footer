@@ -42,8 +42,8 @@ go run . -out hasil.pdf -margin-top 5 -margin-right 15 \
 ## List of Content otomatis
 
 Tulis `!list-of-content` pada satu baris tersendiri di file Markdown. Baris itu
-akan diganti dengan daftar isi berisi heading level 1–3 (bertingkat dan bisa
-diklik). Setelah daftar isi, konten berikutnya dimulai di halaman baru.
+akan diganti dengan daftar isi berisi heading level 1–4 (bertingkat, bisa
+diklik, dan lengkap dengan nomor halaman). Setelah daftar isi, konten berikutnya dimulai di halaman baru.
 
 ```md
 # Laporan Proyek
@@ -51,6 +51,23 @@ diklik). Setelah daftar isi, konten berikutnya dimulai di halaman baru.
 !list-of-content
 
 ## Latar Belakang
+```
+
+## Judul utama, bab, dan nomor halaman
+
+- `#! Judul` (spasi setelah `#!`) menjadi judul utama dokumen. Judul ini tidak
+  masuk List of Content.
+- Setiap heading `#` selalu dimulai di halaman baru.
+- Nomor halaman dicetak di kanan atas. Nomor tidak ditampilkan pada halaman
+  pertama dokumen jika memakai `#!`, dan pada halaman pertama setiap bab (`#`).
+  Untuk itu dokumen dirender dua kali oleh Chromium.
+
+```md
+#! Laporan Tahunan
+
+!list-of-content
+
+# Bab 1
 ```
 
 Ganti footer terpasang dengan file lain (perlu hak akses untuk menulis ke

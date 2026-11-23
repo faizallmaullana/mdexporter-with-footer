@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -34,8 +35,14 @@ const (
 
 	// tocMarker is the Markdown line replaced by an auto-generated List of Content.
 	tocMarker = "!list-of-content"
-	// tocMaxLevel is the deepest heading level included in the List of Content.
-	tocMaxLevel = 3
+	// tocMaxLevel is the deepest heading level (1-4) included in the List of Content.
+	tocMaxLevel = 4
+
+	// docTitleClass marks the main title written as "#! Title".
+	docTitleClass = "doc-title"
+
+	// tocPlaceholder stands in for the List of Content until page numbers are known.
+	tocPlaceholder = "<!--list-of-content-->"
 )
 
 type Config struct {
@@ -63,6 +70,22 @@ var markdownParser = goldmark.New(
 	goldmark.WithExtensions(extension.GFM),
 	goldmark.WithParserOptions(parser.WithAutoHeadingID()),
 )
+
+// convertedDoc is the result of converting Markdown to HTML.
+type convertedDoc struct {
+	HTML       string     // contains tocPlaceholder where the List of Content goes
+	TOC        []tocEntry // headings listed in the List of Content
+	HasTOC     bool       // the document has a "!list-of-content" marker
+	ChapterIDs []string   // ids of "#" headings; each one starts a new page
+	HasTitle   bool       // the document has a "#!" main title
+}
+
+// pageNumbering controls the page number printed at the top right.
+type pageNumbering struct {
+	Hidden map[int]bool // 1-based pages that show no number
+	Total  int          // total page count when known, 0 otherwise
+	Probe  []string     // heading ids linked invisibly so Chromium records their page
+}
 
 type tocEntry struct {
 	Level int
@@ -203,21 +226,45 @@ func exportMarkdown(config Config) error {
 		return fmt.Errorf("read Markdown: %w", err)
 	}
 
-	body, err := convertMarkdown(markdown)
+	doc, err := convertMarkdown(markdown)
 	if err != nil {
 		return fmt.Errorf("convert Markdown: %w", err)
-	}
-
-	document := buildHTMLDocument(body, footer, filepath.Dir(input), margins)
-
-	htmlPath := filepath.Join(tmp, "document.html")
-	if err := os.WriteFile(htmlPath, []byte(document), 0600); err != nil {
-		return fmt.Errorf("write HTML document: %w", err)
 	}
 
 	browser, err := findChromium()
 	if err != nil {
 		return err
+	}
+
+	assetBase := filepath.Dir(input)
+	numbering := pageNumbering{Hidden: map[int]bool{}}
+	if doc.HasTitle {
+		numbering.Hidden[1] = true
+	}
+
+	// Pass 1: find the page of every heading, to fill in the List of Content
+	// and to hide the page number on the first page of each "#" chapter.
+	var headingPages map[string]int
+	if probe := doc.probeIDs(); len(probe) > 0 {
+		total, pages, err := probeHeadingPages(browser, doc, probe, footer, assetBase, margins, tmp, config.Timeout)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: cannot measure heading pages: %v\n", err)
+		} else {
+			headingPages = pages
+			numbering.Total = total
+			for _, id := range doc.ChapterIDs {
+				if page, ok := pages[id]; ok {
+					numbering.Hidden[page] = true
+				}
+			}
+		}
+	}
+
+	document := buildHTMLDocument(doc.html(headingPages), footer, assetBase, margins, numbering)
+
+	htmlPath := filepath.Join(tmp, "document.html")
+	if err := os.WriteFile(htmlPath, []byte(document), 0600); err != nil {
+		return fmt.Errorf("write HTML document: %w", err)
 	}
 
 	if err := exportPDF(browser, htmlPath, output, tmp, config.Timeout); err != nil {
@@ -232,10 +279,12 @@ func exportMarkdown(config Config) error {
 	return nil
 }
 
-// convertMarkdown converts Markdown content into HTML. A paragraph consisting
-// only of "!list-of-content" is replaced by a generated List of Content.
-func convertMarkdown(source []byte) (string, error) {
+// convertMarkdown converts Markdown content into HTML. A paragraph starting
+// with "#! " becomes the main title, and a paragraph consisting only of
+// "!list-of-content" is replaced by a generated List of Content.
+func convertMarkdown(source []byte) (convertedDoc, error) {
 	doc := markdownParser.Parser().Parse(text.NewReader(source))
+	result := convertedDoc{HasTitle: convertTitles(doc, source)}
 
 	var entries []tocEntry
 	hasMarker := false
@@ -247,13 +296,15 @@ func convertMarkdown(source []byte) (string, error) {
 
 		switch n := node.(type) {
 		case *ast.Heading:
+			if isDocTitle(n) {
+				return ast.WalkSkipChildren, nil
+			}
+
+			id := headingID(n)
+			if n.Level == 1 && id != "" {
+				result.ChapterIDs = append(result.ChapterIDs, id)
+			}
 			if n.Level <= tocMaxLevel {
-				var id string
-				if value, ok := n.AttributeString("id"); ok {
-					if b, ok := value.([]byte); ok {
-						id = string(b)
-					}
-				}
 				entries = append(entries, tocEntry{
 					Level: n.Level,
 					ID:    id,
@@ -271,20 +322,122 @@ func convertMarkdown(source []byte) (string, error) {
 		return ast.WalkContinue, nil
 	})
 	if err != nil {
-		return "", err
+		return result, err
 	}
 
 	var output bytes.Buffer
 	if err := markdownParser.Renderer().Render(&output, source, doc); err != nil {
-		return "", err
+		return result, err
 	}
 
-	html := output.String()
+	result.HTML = output.String()
 	if hasMarker {
-		html = strings.ReplaceAll(html, "<p>"+tocMarker+"</p>", buildTOC(entries))
+		result.HTML = strings.ReplaceAll(result.HTML, "<p>"+tocMarker+"</p>", tocPlaceholder)
+		result.TOC = entries
+		result.HasTOC = true
 	}
 
-	return html, nil
+	return result, nil
+}
+
+// html returns the document body with the List of Content filled in. pages maps
+// heading ids to page numbers; nil renders placeholder numbers of equal width.
+func (d convertedDoc) html(pages map[string]int) string {
+	out := d.HTML
+	if d.HasTOC {
+		out = strings.ReplaceAll(out, tocPlaceholder, buildTOC(d.TOC, pages))
+	}
+	return transformTables(out, pages)
+}
+
+// probeIDs returns the heading ids whose page must be measured.
+func (d convertedDoc) probeIDs() []string {
+	seen := map[string]bool{}
+	var ids []string
+
+	add := func(id string) {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+
+	for _, id := range d.ChapterIDs {
+		add(id)
+	}
+	for _, entry := range d.TOC {
+		add(entry.ID)
+	}
+	for table, rows := range tableRowCounts(d.HTML) {
+		for row := 0; row < rows; row++ {
+			add(tableRowID(table, row))
+		}
+	}
+
+	return ids
+}
+
+// convertTitles turns top-level paragraphs starting with "#! " into level 1
+// headings of class doc-title. It reports whether any title was found.
+func convertTitles(doc ast.Node, source []byte) bool {
+	found := false
+
+	for node := doc.FirstChild(); node != nil; node = node.NextSibling() {
+		para, ok := node.(*ast.Paragraph)
+		if !ok {
+			continue
+		}
+
+		first, ok := para.FirstChild().(*ast.Text)
+		if !ok {
+			continue
+		}
+
+		value := first.Segment.Value(source)
+		if len(value) < 3 || !bytes.HasPrefix(value, []byte("#!")) || (value[2] != ' ' && value[2] != '\t') {
+			continue
+		}
+
+		start := first.Segment.Start + 2
+		for start < first.Segment.Stop && (source[start] == ' ' || source[start] == '\t') {
+			start++
+		}
+		first.Segment = first.Segment.WithStart(start)
+
+		heading := ast.NewHeading(1)
+		heading.SetAttributeString("class", []byte(docTitleClass))
+		for child := para.FirstChild(); child != nil; {
+			next := child.NextSibling()
+			heading.AppendChild(heading, child)
+			child = next
+		}
+
+		doc.ReplaceChild(doc, para, heading)
+		node = heading
+		found = true
+	}
+
+	return found
+}
+
+// isDocTitle reports whether a heading is the "#!" main title.
+func isDocTitle(heading *ast.Heading) bool {
+	value, ok := heading.AttributeString("class")
+	if !ok {
+		return false
+	}
+	class, _ := value.([]byte)
+	return string(class) == docTitleClass
+}
+
+// headingID returns the id attribute of a heading, or "".
+func headingID(heading *ast.Heading) string {
+	value, ok := heading.AttributeString("id")
+	if !ok {
+		return ""
+	}
+	id, _ := value.([]byte)
+	return string(id)
 }
 
 // nodeText returns the plain text content of an inline-containing node.
@@ -315,7 +468,7 @@ func nodeText(node ast.Node, source []byte) string {
 }
 
 // buildTOC renders the List of Content as nested lists linking to headings.
-func buildTOC(entries []tocEntry) string {
+func buildTOC(entries []tocEntry, pages map[string]int) string {
 	var buf strings.Builder
 
 	buf.WriteString(`<nav class="toc">` + "\n")
@@ -360,12 +513,23 @@ func buildTOC(entries []tocEntry) string {
 			openItem(depth)
 		}
 
-		title := htmlEscape(entry.Title)
-		if entry.ID != "" {
-			buf.WriteString(`<a class="toc-entry" href="#` + htmlEscape(entry.ID) + `">` + title + `</a>`)
-		} else {
+		title := `<span class="toc-text">` + htmlEscape(entry.Title) + `</span>`
+		if entry.ID == "" {
 			buf.WriteString(`<span class="toc-entry">` + title + `</span>`)
+			continue
 		}
+
+		page := "000"
+		if pages != nil {
+			if number, ok := pages[entry.ID]; ok {
+				page = strconv.Itoa(number)
+			} else {
+				page = ""
+			}
+		}
+
+		buf.WriteString(`<a class="toc-entry" href="#` + htmlEscape(entry.ID) + `">` + title +
+			`<span class="toc-dots"></span><span class="toc-page">` + page + `</span></a>`)
 	}
 
 	for depth > 0 {
@@ -389,7 +553,7 @@ func htmlEscape(value string) string {
 }
 
 // buildHTMLDocument generates the complete HTML document.
-func buildHTMLDocument(body, footerPath, assetBasePath string, margins PageMargins) string {
+func buildHTMLDocument(body, footerPath, assetBasePath string, margins PageMargins, numbering pageNumbering) string {
 	footerURL := filepath.ToSlash(footerPath)
 	assetBaseURL := (&url.URL{
 		Scheme: "file",
@@ -424,6 +588,8 @@ func buildHTMLDocument(body, footerPath, assetBasePath string, margins PageMargi
 	}
 }
 
+%s
+
 * {
 	box-sizing: border-box;
 }
@@ -444,6 +610,22 @@ body {
 h1, h2, h3, h4, h5, h6 {
 	page-break-after: avoid;
 	break-after: avoid;
+}
+
+/* Every chapter ("#") starts on a new page. */
+h1 {
+	break-before: page;
+	page-break-before: always;
+}
+
+/* Main title ("#!"). */
+h1.doc-title {
+	break-before: auto;
+	page-break-before: auto;
+	font-size: 2.4em;
+	padding-bottom: 8px;
+	margin-bottom: 28px;
+	border-bottom: 2px solid #222;
 }
 
 p {
@@ -471,12 +653,14 @@ code {
 table {
 	border-collapse: collapse;
 	width: 100%%;
-	margin-bottom: 12px;
+	margin: 4px 0 14px;
+	font-size: 0.95em;
+	border: 1px solid #b8c4d6;
 }
 
 th, td {
-	border: 1px solid #ccc;
-	padding: 5px 8px;
+	border: 1px solid #c9d3e0;
+	padding: 6px 10px;
 	text-align: left;
 	vertical-align: top;
 }
@@ -485,8 +669,47 @@ thead {
 	display: table-header-group;
 }
 
+th {
+	background: #1f4e8c;
+	color: #fff;
+	font-weight: bold;
+	border-color: #1f4e8c;
+	-webkit-print-color-adjust: exact;
+	print-color-adjust: exact;
+}
+
+tbody tr:nth-child(odd) {
+	background: #ffffff;
+}
+
+tbody tr:nth-child(even) {
+	background: #e9f0f9;
+	-webkit-print-color-adjust: exact;
+	print-color-adjust: exact;
+}
+
+tbody tr.tr-odd {
+	background: #ffffff;
+}
+
+tbody tr.tr-even {
+	background: #e9f0f9;
+	-webkit-print-color-adjust: exact;
+	print-color-adjust: exact;
+}
+
 tr {
 	break-inside: avoid;
+}
+
+/* Header repeated on a following page: duller than the main header. */
+tbody tr.table-cont-header,
+tbody tr.table-cont-header th {
+	background: #5f6f86;
+	border-color: #5f6f86;
+	break-after: avoid;
+	-webkit-print-color-adjust: exact;
+	print-color-adjust: exact;
 }
 
 blockquote {
@@ -555,8 +778,28 @@ li {
 }
 
 .toc-entry {
-	display: block;
+	display: flex;
+	align-items: baseline;
 	padding: 2px 0;
+}
+
+.toc-text {
+	flex: 0 1 auto;
+	min-width: 0;
+}
+
+.toc-dots {
+	flex: 1 1 24px;
+	min-width: 24px;
+	margin: 0 6px;
+	border-bottom: 1px dotted #999;
+}
+
+.toc-page {
+	flex: 0 0 auto;
+	min-width: 2em;
+	text-align: right;
+	font-variant-numeric: tabular-nums;
 }
 
 /* Level 1: bold, separated by a rule. */
@@ -588,28 +831,41 @@ li {
 	margin-right: 6px;
 }
 
-/* Level 3 and deeper: regular, smaller, muted with a dash marker. */
-.toc-l3 > .toc-entry,
-.toc-l4 > .toc-entry,
-.toc-l5 > .toc-entry,
-.toc-l6 > .toc-entry {
+/* Level 3: regular, smaller, muted with a dash marker. */
+.toc-l3 > .toc-entry {
 	font-size: 0.93em;
 	font-weight: normal;
 	color: #555;
 }
 
-.toc-l3 > .toc-entry::before,
+.toc-l3 > .toc-entry::before {
+	content: "\2013";
+	color: #9aa3b0;
+	margin-right: 6px;
+}
+
+/* Level 4 and deeper: smallest, italic, lightest, with a dot marker. */
+.toc-l4 > .toc-entry,
+.toc-l5 > .toc-entry,
+.toc-l6 > .toc-entry {
+	font-size: 0.88em;
+	font-weight: normal;
+	font-style: italic;
+	color: #777;
+}
+
 .toc-l4 > .toc-entry::before,
 .toc-l5 > .toc-entry::before,
 .toc-l6 > .toc-entry::before {
-	content: "\2013";
-	color: #9aa3b0;
+	content: "\2022";
+	color: #b0b7c3;
 	margin-right: 6px;
 }
 `,
 		formatMM(margins.Top),
 		formatMM(margins.Bottom),
 		cssString(footerURI),
+		pageNumberCSS(numbering, margins.Right),
 		formatMM(margins.Right),
 		formatMM(margins.Left),
 	)
@@ -624,9 +880,278 @@ li {
 	<style>` + style + `</style>
 </head>
 <body>
-` + body + `
+` + body + probeLinks(numbering.Probe) + `
 </body>
 </html>`
+}
+
+// pageNumberCSS returns the CSS printing the page number at the top right.
+// Pages listed in numbering.Hidden show no number. When the total page count
+// is known, a custom counter style maps those pages to an empty string, because
+// Chromium cannot select "the first page of a chapter" in @page rules.
+func pageNumberCSS(numbering pageNumbering, rightMM float64) string {
+	var css strings.Builder
+	counter := "counter(page)"
+
+	if numbering.Total > 0 {
+		css.WriteString("@counter-style page-number {\n\tsystem: fixed;\n\tsymbols:")
+		for page := 1; page <= numbering.Total; page++ {
+			if numbering.Hidden[page] {
+				css.WriteString(` ""`)
+			} else {
+				fmt.Fprintf(&css, ` "%d"`, page)
+			}
+		}
+		css.WriteString(";\n\tfallback: decimal;\n}\n")
+		counter = "counter(page, page-number)"
+	}
+
+	fmt.Fprintf(&css, `@page {
+	@top-right {
+		content: %s;
+		text-align: right;
+		vertical-align: middle;
+		padding-right: %smm;
+		font-family: Aptos, Arial, sans-serif;
+		font-size: 10pt;
+		color: #555;
+	}
+}
+`, counter, formatMM(rightMM))
+
+	if numbering.Hidden[1] {
+		css.WriteString("@page :first {\n\t@top-right {\n\t\tcontent: none;\n\t}\n}\n")
+	}
+
+	return css.String()
+}
+
+var (
+	tableRe = regexp.MustCompile(`(?s)<table>.*?</table>`)
+	theadRe = regexp.MustCompile(`(?s)<thead>\s*(<tr>.*?</tr>)\s*</thead>`)
+	tbodyRe = regexp.MustCompile(`(?s)<tbody>(.*?)</tbody>`)
+	rowRe   = regexp.MustCompile(`(?s)<tr>.*?</tr>`)
+)
+
+// tableRowID returns the id given to a body row while measuring pages.
+func tableRowID(table, row int) string {
+	return fmt.Sprintf("tbl%d-r%d", table, row)
+}
+
+// tableRowCounts returns the number of body rows of every table.
+func tableRowCounts(html string) []int {
+	var counts []int
+	for _, table := range tableRe.FindAllString(html, -1) {
+		count := 0
+		if body := tbodyRe.FindStringSubmatch(table); body != nil {
+			count = len(rowRe.FindAllString(body[1], -1))
+		}
+		counts = append(counts, count)
+	}
+	return counts
+}
+
+// transformTables prepares every table for printing. Body rows get an odd/even
+// class (the stripes must ignore inserted rows). With pages == nil, rows also
+// get an id so their page can be measured. With measured pages, the repeated
+// header is replaced by explicit "continuation header" rows inserted before the
+// first row of each following page, so they can be colored differently from the
+// main header. They have the same height as the header, so pages break exactly
+// as they did while measuring.
+func transformTables(html string, pages map[string]int) string {
+	index := 0
+	changed := false
+
+	out := tableRe.ReplaceAllStringFunc(html, func(table string) string {
+		current := index
+		index++
+
+		head := theadRe.FindStringSubmatch(table)
+		body := tbodyRe.FindStringSubmatchIndex(table)
+		if head == nil || body == nil {
+			return table
+		}
+		changed = true
+
+		continuation := strings.Replace(head[1], "<tr>", `<tr class="table-cont-header">`, 1)
+
+		row := 0
+		rows := rowRe.ReplaceAllStringFunc(table[body[2]:body[3]], func(tr string) string {
+			number := row
+			row++
+
+			class := "tr-odd"
+			if number%2 == 1 {
+				class = "tr-even"
+			}
+
+			id := tableRowID(current, number)
+			attrs := ` class="` + class + `"`
+			prefix := ""
+
+			if pages == nil {
+				attrs += ` id="` + id + `"`
+			} else if number > 0 {
+				page, ok := pages[id]
+				previous, okPrevious := pages[tableRowID(current, number-1)]
+				if ok && okPrevious && page > previous {
+					prefix = continuation
+				}
+			}
+
+			return prefix + "<tr" + attrs + ">" + strings.TrimPrefix(tr, "<tr>")
+		})
+
+		return table[:body[2]] + rows + table[body[3]:]
+	})
+
+	if changed && pages != nil {
+		// Headers are inserted explicitly, so stop Chromium repeating them.
+		out = "<style>thead { display: table-row-group; }</style>\n" + out
+	}
+
+	return out
+}
+
+// probeLinks returns invisible links to the given heading ids. Chromium only
+// records a PDF destination for anchors that are linked to.
+func probeLinks(ids []string) string {
+	if len(ids) == 0 {
+		return ""
+	}
+
+	var buf strings.Builder
+	buf.WriteString(`<div style="position:absolute;top:0;left:0;width:0;height:0;overflow:hidden">`)
+	for _, id := range ids {
+		buf.WriteString(`<a href="#` + htmlEscape(id) + `">.</a>`)
+	}
+	buf.WriteString("</div>")
+
+	return buf.String()
+}
+
+// probeHeadingPages renders the document once and returns the total page count
+// and the page on which each of the given heading ids is.
+func probeHeadingPages(
+	browser string,
+	doc convertedDoc,
+	ids []string,
+	footer string,
+	assetBase string,
+	margins PageMargins,
+	tmp string,
+	timeout time.Duration,
+) (int, map[string]int, error) {
+	probe := buildHTMLDocument(doc.html(nil), footer, assetBase, margins, pageNumbering{Probe: ids})
+
+	htmlPath := filepath.Join(tmp, "probe.html")
+	if err := os.WriteFile(htmlPath, []byte(probe), 0600); err != nil {
+		return 0, nil, err
+	}
+
+	pdfPath := filepath.Join(tmp, "probe.pdf")
+	if err := exportPDF(browser, htmlPath, pdfPath, tmp, timeout); err != nil {
+		return 0, nil, err
+	}
+
+	data, err := os.ReadFile(pdfPath)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	return pdfDestinationPages(data, ids)
+}
+
+var (
+	pdfRootRe  = regexp.MustCompile(`/Root\s+(\d+)\s+\d+\s+R`)
+	pdfPagesRe = regexp.MustCompile(`/Pages\s+(\d+)\s+\d+\s+R`)
+	pdfDestsRe = regexp.MustCompile(`/Dests\s+(\d+)\s+\d+\s+R`)
+	pdfKidsRe  = regexp.MustCompile(`(?s)/Kids\s*\[([^\]]*)\]`)
+	pdfRefRe   = regexp.MustCompile(`(\d+)\s+\d+\s+R`)
+)
+
+// pdfObject returns the body of the numbered object, or nil.
+func pdfObject(data []byte, number string) []byte {
+	marker := []byte("\n" + number + " 0 obj")
+	start := bytes.Index(data, marker)
+	if start < 0 {
+		return nil
+	}
+
+	rest := data[start+len(marker):]
+	end := bytes.Index(rest, []byte("endobj"))
+	if end < 0 {
+		return nil
+	}
+
+	return rest[:end]
+}
+
+// pdfDestinationPages reads a Chromium (Skia) PDF and returns its page count
+// and the 1-based page of every named destination in ids (by id).
+func pdfDestinationPages(data []byte, ids []string) (int, map[string]int, error) {
+	tail := data[max(0, len(data)-8192):]
+	roots := pdfRootRe.FindAllSubmatch(tail, -1)
+	if len(roots) == 0 {
+		return 0, nil, errors.New("PDF catalog not found")
+	}
+
+	catalog := pdfObject(data, string(roots[len(roots)-1][1]))
+	pagesRef := pdfPagesRe.FindSubmatch(catalog)
+	destsRef := pdfDestsRe.FindSubmatch(catalog)
+	if pagesRef == nil {
+		return 0, nil, errors.New("PDF page tree not found")
+	}
+	if destsRef == nil {
+		return 0, nil, errors.New("PDF has no named destinations")
+	}
+
+	pageIndex := map[string]int{}
+	var walk func(number string, depth int)
+	walk = func(number string, depth int) {
+		kids := pdfKidsRe.FindSubmatch(pdfObject(data, number))
+		if kids == nil || depth > 32 {
+			pageIndex[number] = len(pageIndex) + 1
+			return
+		}
+		for _, ref := range pdfRefRe.FindAllSubmatch(kids[1], -1) {
+			walk(string(ref[1]), depth+1)
+		}
+	}
+	walk(string(pagesRef[1]), 0)
+
+	dests := pdfObject(data, string(destsRef[1]))
+	pages := map[string]int{}
+	for _, id := range ids {
+		re := regexp.MustCompile("/" + regexp.QuoteMeta(pdfName(id)) + `\s*\[\s*(\d+)\s+\d+\s+R`)
+		match := re.FindSubmatch(dests)
+		if match == nil {
+			continue
+		}
+		if page, ok := pageIndex[string(match[1])]; ok {
+			pages[id] = page
+		}
+	}
+
+	if len(pageIndex) == 0 {
+		return 0, nil, errors.New("PDF has no pages")
+	}
+
+	return len(pageIndex), pages, nil
+}
+
+// pdfName encodes a string as the body of a PDF name object.
+func pdfName(value string) string {
+	var buf strings.Builder
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c <= 0x20 || c >= 0x7f || strings.IndexByte("()<>[]{}/%#", c) >= 0 {
+			fmt.Fprintf(&buf, "#%02X", c)
+		} else {
+			buf.WriteByte(c)
+		}
+	}
+	return buf.String()
 }
 
 // formatMM formats a margin value without unnecessary trailing zeros.
