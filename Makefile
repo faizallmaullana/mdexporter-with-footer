@@ -8,14 +8,14 @@ all: build
 
 build: clean $(BINARY)
 
-$(BINARY): main.go go.mod
+$(BINARY): $(wildcard *.go) go.mod
 	mkdir -p $(BUILD_DIR)
 	$(GO) build -buildvcs=false -o $(BINARY) .
 
 # install does not build: under sudo, Go is usually missing from PATH and
 # building as root would leave root-owned files in $(BUILD_DIR).
 # Run `make build` as a normal user first, then `sudo make install`.
-install: build install.sh public/footer.png
+install: install.sh public/footer.png
 	@if [ ! -f $(BINARY) ]; then \
 		echo "error: $(BINARY) not found; run 'make build' first (without sudo)" >&2; exit 1; \
 	fi
