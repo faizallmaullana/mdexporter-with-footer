@@ -187,7 +187,11 @@ func exportMarkdown(config Config) error {
 
 	output := config.Output
 	if output == "" {
-		output = strings.TrimSuffix(input, filepath.Ext(input)) + ".pdf"
+		output = strings.TrimSuffix(input, filepath.Ext(input))
+		if config.Diff != "" {
+			output += "-diff"
+		}
+		output += ".pdf"
 	}
 
 	output, err = filepath.Abs(output)
